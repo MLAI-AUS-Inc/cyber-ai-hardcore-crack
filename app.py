@@ -178,8 +178,7 @@ async def handle_mention(event, say, client):
         await say('Sorry, I encountered an error processing your message.')
 
 # Start the app
-async def start_app():
-    """Start the async app"""
+if __name__ == "__main__":
     logger.info("⚡️ Bolt app is starting...")
     logger.info("⚡️ Initializing Slack Bot...")
     
@@ -188,11 +187,8 @@ async def start_app():
     logger.info(f"🚀 Starting HTTP server on port {port}...")
     
     try:
-        await app.async_start(port=port)
+        app.start(port=port)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
     except Exception as e:
-        logger.error(f"❌ Bot crashed: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(start_app()) 
+        logger.error(f"❌ Bot crashed: {e}") 
