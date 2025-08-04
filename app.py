@@ -26,10 +26,11 @@ The system prompt is defined in prompt.py and uses the DISCOUNT_CODE environment
 import os
 import re
 import logging
+import asyncio
 from google import genai
 from google.genai import types
-from slack_bolt import App
-from slack_sdk import WebClient
+from slack_bolt.async_app import AsyncApp
+from slack_sdk.web.async_client import AsyncWebClient
 from dotenv import load_dotenv
 from prompt import get_system_prompt
 
@@ -78,24 +79,29 @@ logger.info("==========================")
 # Initialize Google Gemini client
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
-app = App(
+app = AsyncApp(
     token=SLACK_BOT_TOKEN,
     signing_secret=SLACK_SIGNING_SECRET
 )
-sync_client = WebClient(token=SLACK_BOT_TOKEN)
+async_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
 
-def call_llm(prompt: str) -> str:
+async def call_llm(prompt: str) -> str:
     """Call the Google Gemini API using native genai client"""
     try:
         logger.info(f"🤖 Calling Gemini API with prompt length: {len(prompt)} chars")
         
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=1024
+        # Run the synchronous genai call in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=1024
+                    )
                 )
             )
         )
@@ -110,7 +116,7 @@ def call_llm(prompt: str) -> str:
 
 # Listen for mentions (when someone tags the bot)
 @app.event("app_mention")
-def handle_mention(event, say, client):
+async def handle_mention(event, say, client):
     """Handle when the bot is mentioned with @botname"""
     
     # Extract event details
@@ -121,7 +127,7 @@ def handle_mention(event, say, client):
     
     # Get user information
     try:
-        user_info = sync_client.users_info(user=user_id)
+        user_info = await async_client.users_info(user=user_id)
         username = user_info['user']['name']
         display_name = user_info['user'].get('profile', {}).get('display_name', username)
         real_name = user_info['user'].get('profile', {}).get('real_name', username)
@@ -151,28 +157,29 @@ def handle_mention(event, say, client):
         
         if cleaned_text:
             logger.info("Sending to Gemini...")
-            response = call_llm(cleaned_text)
+            response = await call_llm(cleaned_text)
             logger.info(f"Gemini Response: {response}")
 
             if SHOULD_REPLY_IN_CHANNEL:
                 # Reply in main channel
-                say(f"<@{user_id}> {response}")
+                await say(f"<@{user_id}> {response}")
             # Reply in thread
-            say(f"<@{user_id}> {response}", thread_ts=message_ts)
+            await say(f"<@{user_id}> {response}", thread_ts=message_ts)
         else:
             logger.info("Empty message, sending default greeting")
             if SHOULD_REPLY_IN_CHANNEL:
                 # Reply in main channel
-                say(f"<@{user_id}> Hi! How can I help you?")
+                await say(f"<@{user_id}> Hi! How can I help you?")
             # Reply in thread
-            say(f"<@{user_id}> Hi! How can I help you?", thread_ts=message_ts)
+            await say(f"<@{user_id}> Hi! How can I help you?", thread_ts=message_ts)
             
     except Exception as error:
         logger.error(f'Error processing mention: {error}')
-        say('Sorry, I encountered an error processing your message.')
+        await say('Sorry, I encountered an error processing your message.')
 
 # Start the app
-if __name__ == "__main__":
+async def start_app():
+    """Start the async app"""
     logger.info("⚡️ Bolt app is starting...")
     logger.info("⚡️ Initializing Slack Bot...")
     
@@ -181,8 +188,11 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting HTTP server on port {port}...")
     
     try:
-        app.start(port=port)
+        await app.async_start(port=port)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
     except Exception as e:
-        logger.error(f"❌ Bot crashed: {e}") 
+        logger.error(f"❌ Bot crashed: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(start_app()) 
