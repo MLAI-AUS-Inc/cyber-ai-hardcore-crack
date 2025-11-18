@@ -27,6 +27,7 @@ import os
 import re
 import logging
 import asyncio
+from collections import defaultdict
 from google import genai
 from google.genai import types
 from slack_bolt.async_app import AsyncApp
@@ -44,6 +45,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+# Count how many attempts per channel (every 15th will be "easy mode")
+ATTEMPT_COUNTS = defaultdict(int)
 
 # Get environment variables
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -65,9 +68,6 @@ if not GOOGLE_API_KEY:
 
 DISCOUNT_CODE = os.environ.get("DISCOUNT_CODE", "4b0daf70118becc1")
 
-# Generate system prompt using the discount code
-SYSTEM_PROMPT = get_system_prompt(DISCOUNT_CODE)
-
 # Log startup configuration
 logger.info("=== SLACK BOT STARTUP ===")
 logger.info(f"Bot Token: {SLACK_BOT_TOKEN[:12]}..." if SLACK_BOT_TOKEN else "No Bot Token")
@@ -85,7 +85,7 @@ app = AsyncApp(
 )
 async_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
 
-async def call_llm(prompt: str) -> str:
+async def call_llm(prompt: str, system_prompt: str) -> str:
     """Call the Google Gemini API using native genai client"""
     try:
         logger.info(f"🤖 Calling Gemini API with prompt length: {len(prompt)} chars")
@@ -98,7 +98,7 @@ async def call_llm(prompt: str) -> str:
                 model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=system_prompt,
                     thinking_config=types.ThinkingConfig(
                         thinking_budget=1024
                     )
@@ -156,8 +156,15 @@ async def handle_mention(event, say, client):
         logger.info(f"Cleaned Message: {cleaned_text}")
         
         if cleaned_text:
+            # Count attempts per channel and decide if this is an easy round
+            ATTEMPT_COUNTS[channel_id] += 1
+            attempts = ATTEMPT_COUNTS[channel_id]
+            is_easy_round = (attempts % 15 == 0)
+            logger.info(f"Channel {channel_id} has {attempts} attempts. Easy round? {is_easy_round}")
+
+            system_prompt = get_system_prompt(DISCOUNT_CODE, is_easy_round=is_easy_round)
             logger.info("Sending to Gemini...")
-            response = await call_llm(cleaned_text)
+            response = await call_llm(cleaned_text, system_prompt=system_prompt)
             logger.info(f"Gemini Response: {response}")
 
             if SHOULD_REPLY_IN_CHANNEL:
