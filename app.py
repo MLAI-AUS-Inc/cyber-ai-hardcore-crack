@@ -18,6 +18,7 @@ SLACK_BOT_TOKEN     (Required): Bot token for Slack API access
 SLACK_SIGNING_SECRET (Required): Signing secret for HTTP mode webhook verification
 GOOGLE_API_KEY      (Required): Google API key for Gemini API access
 DISCOUNT_CODE       (Optional): The secret discount code to guard (default: 4b0daf70118becc1)
+DISCOUNT_CODES      (Optional): Comma-separated list of discount codes; if provided this overrides DISCOUNT_CODE
 
 System Prompt:
 The system prompt is defined in prompt.py and uses the DISCOUNT_CODE environment variable.
@@ -25,8 +26,10 @@ The system prompt is defined in prompt.py and uses the DISCOUNT_CODE environment
 """
 import os
 import re
+import json
 import logging
 import asyncio
+from pathlib import Path
 from collections import defaultdict
 from google import genai
 from google.genai import types
@@ -47,6 +50,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # Count how many attempts per channel (every 15th will be "easy mode")
 ATTEMPT_COUNTS = defaultdict(int)
+# Track discount code inventory in memory (persisted to disk between restarts)
+inventory_lock = asyncio.Lock()
+STATE_PATH = Path(__file__).parent / "state" / "discount_codes.json"
 
 # Get environment variables
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
@@ -61,19 +67,105 @@ SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
 if not SLACK_SIGNING_SECRET:
     raise ValueError("SLACK_SIGNING_SECRET environment variable is required")
 
-# Optional environment variables with defaults
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable is required for Gemini API")
 
 DISCOUNT_CODE = os.environ.get("DISCOUNT_CODE", "4b0daf70118becc1")
+DISCOUNT_CODES_ENV = os.environ.get("DISCOUNT_CODES")
+DISCOUNT_CODE_PATTERN = re.compile(r"discountcode=([^?&#\\s]+)", re.IGNORECASE)
+
+def extract_discount_code(raw: str) -> str:
+    """Normalize a code value. Accepts full URLs, query fragments, or raw codes."""
+    cleaned = raw.strip().replace("\n", "").replace("\r", "")
+    match = DISCOUNT_CODE_PATTERN.search(cleaned)
+    if match:
+        return match.group(1)
+    if "=" in cleaned:
+        return cleaned.split("=")[-1]
+    return cleaned
+
+def parse_discount_codes() -> list[str]:
+    """Parse discount codes from DISCOUNT_CODES, DISCOUNT_CODE, and DISCOUNT_CODE_* env vars."""
+    codes: list[str] = []
+
+    # Comma-separated list
+    if DISCOUNT_CODES_ENV:
+        codes.extend(
+            extract_discount_code(code)
+            for code in DISCOUNT_CODES_ENV.split(",")
+            if code.strip()
+        )
+
+    # Single fallback
+    if DISCOUNT_CODE:
+        codes.append(extract_discount_code(DISCOUNT_CODE))
+
+    # Numbered env vars (DISCOUNT_CODE_1, DISCOUNT_CODE_2, ...)
+    numbered_keys = sorted(
+        [key for key in os.environ if key.startswith("DISCOUNT_CODE_")],
+        key=lambda k: int(k.split("_")[-1]) if k.split("_")[-1].isdigit() else k,
+    )
+    for key in numbered_keys:
+        value = os.environ.get(key)
+        if value:
+            codes.append(extract_discount_code(value))
+
+    # Preserve order but remove duplicates
+    seen = set()
+    unique_codes = []
+    for code in codes:
+        if code and code not in seen:
+            seen.add(code)
+            unique_codes.append(code)
+    return unique_codes or [DISCOUNT_CODE]
+
+DISCOUNT_CODES = parse_discount_codes()
+
+def ensure_state_dir():
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def load_code_state() -> dict:
+    """Load discount code state from disk; if missing, seed from env codes."""
+    ensure_state_dir()
+    if STATE_PATH.exists():
+        try:
+            with STATE_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                available = data.get("available_codes", [])
+                used = data.get("used_codes", [])
+                last_given = data.get("last_given_code")
+                # If new codes are added via env, append them to available if not already tracked
+                known_codes = set(available + used)
+                for code in DISCOUNT_CODES:
+                    if code not in known_codes:
+                        available.append(code)
+                return {
+                    "available_codes": available,
+                    "used_codes": used,
+                    "last_given_code": last_given,
+                }
+        except Exception as error:
+            logger.warning(f"Could not load code state, re-seeding from env: {error}")
+    return {
+        "available_codes": DISCOUNT_CODES.copy(),
+        "used_codes": [],
+        "last_given_code": None,
+    }
+
+def save_code_state(state: dict) -> None:
+    ensure_state_dir()
+    with STATE_PATH.open("w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+code_state = load_code_state()
 
 # Log startup configuration
 logger.info("=== SLACK BOT STARTUP ===")
 logger.info(f"Bot Token: {SLACK_BOT_TOKEN[:12]}..." if SLACK_BOT_TOKEN else "No Bot Token")
 logger.info(f"Signing Secret: {SLACK_SIGNING_SECRET[:12]}..." if SLACK_SIGNING_SECRET else "No Signing Secret")
 logger.info(f"Google API Key: {GOOGLE_API_KEY[:12]}..." if GOOGLE_API_KEY else "No Google API Key")
-logger.info(f"Discount Code: {DISCOUNT_CODE}")
+logger.info(f"Discount codes (total {len(DISCOUNT_CODES)}): {', '.join(DISCOUNT_CODES)}")
 logger.info("==========================")
 
 # Initialize Google Gemini client
@@ -162,7 +254,70 @@ async def handle_mention(event, say, client):
             is_easy_round = (attempts % 15 == 0)
             logger.info(f"Channel {channel_id} has {attempts} attempts. Easy round? {is_easy_round}")
 
-            system_prompt = get_system_prompt(DISCOUNT_CODE, is_easy_round=is_easy_round)
+            # Quick inventory stats
+            available_count = len(code_state["available_codes"])
+            used_count = len(code_state["used_codes"])
+            total_count = available_count + used_count
+
+            # Simple heuristics for direct handling
+            lower_text = cleaned_text.lower()
+            is_count_query = (
+                ("how many" in lower_text or "how much" in lower_text or "how long" in lower_text)
+                and ("code" in lower_text or "ticket" in lower_text)
+            )
+            is_code_request = ("discount" in lower_text or "promo code" in lower_text or "free ticket" in lower_text)
+
+            # Handle count queries directly to avoid LLM hallucinations
+            if is_count_query:
+                response = (
+                    f"We have {available_count} free ticket discount code(s) left "
+                    f"({used_count} already issued, {total_count} total)."
+                    if available_count > 0
+                    else f"All {total_count} free ticket codes have been used. No more left."
+                )
+                await say(f"<@{user_id}> {response}", thread_ts=message_ts)
+                if SHOULD_REPLY_IN_CHANNEL:
+                    await say(f"<@{user_id}> {response}")
+                return
+
+            # Issue a real code only during easy mode and only if user is clearly asking
+            if is_easy_round and is_code_request:
+                async with inventory_lock:
+                    if code_state["available_codes"]:
+                        issued_code = code_state["available_codes"].pop(0)
+                        code_state["used_codes"].append(issued_code)
+                        code_state["last_given_code"] = issued_code
+                        save_code_state(code_state)
+                        available_count = len(code_state["available_codes"])
+                        used_count = len(code_state["used_codes"])
+                        total_count = available_count + used_count
+                    else:
+                        issued_code = None
+
+                if issued_code:
+                    response = (
+                        "Easy mode unlocked! Here's a real free ticket link (one-time use): "
+                        f"https://events.humanitix.com/keep-our-community-safe-mlai-hackathon?discountcode={issued_code} "
+                        f"(Codes left after this: {available_count}/{total_count})."
+                    )
+                else:
+                    response = "Easy mode is on, but we're out of discount codes. 🥲"
+
+                await say(f"<@{user_id}> {response}", thread_ts=message_ts)
+                if SHOULD_REPLY_IN_CHANNEL:
+                    await say(f"<@{user_id}> {response}")
+                return
+
+            giveaway_code = (
+                code_state["available_codes"][0] if is_easy_round and code_state["available_codes"] else None
+            )
+            system_prompt = get_system_prompt(
+                discount_codes=DISCOUNT_CODES,
+                available_count=available_count,
+                used_count=used_count,
+                is_easy_round=is_easy_round,
+                giveaway_code=giveaway_code,
+            )
             logger.info("Sending to Gemini...")
             response = await call_llm(cleaned_text, system_prompt=system_prompt)
             logger.info(f"Gemini Response: {response}")
