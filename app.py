@@ -251,7 +251,7 @@ async def handle_mention(event, say, client):
             # Count attempts per channel and decide if this is an easy round
             ATTEMPT_COUNTS[channel_id] += 1
             attempts = ATTEMPT_COUNTS[channel_id]
-            is_easy_round = (attempts % 15 == 0)
+            is_easy_round = (attempts % 3 == 0)
             logger.info(f"Channel {channel_id} has {attempts} attempts. Easy round? {is_easy_round}")
 
             # Quick inventory stats
