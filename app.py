@@ -48,8 +48,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-# Count how many attempts per channel (every 15th will be "easy mode")
-ATTEMPT_COUNTS = defaultdict(int)
+# Track attempts and dynamic easy-mode thresholds per channel
+CHANNEL_STATE = defaultdict(lambda: {"attempts": 0, "interval": 15, "next_threshold": 15})
 # Track discount code inventory in memory (persisted to disk between restarts)
 inventory_lock = asyncio.Lock()
 STATE_PATH = Path(__file__).parent / "state" / "discount_codes.json"
@@ -259,10 +259,16 @@ async def handle_mention(event, say, client):
         
         if cleaned_text:
             # Count attempts per channel and decide if this is an easy round
-            ATTEMPT_COUNTS[channel_id] += 1
-            attempts = ATTEMPT_COUNTS[channel_id]
-            is_easy_round = (attempts % 3 == 0)
-            logger.info(f"Channel {channel_id} has {attempts} attempts. Easy round? {is_easy_round}")
+            state = CHANNEL_STATE[channel_id]
+            state["attempts"] += 1
+            attempts = state["attempts"]
+            interval = state["interval"]
+            next_threshold = state["next_threshold"]
+            is_easy_round = attempts >= next_threshold
+            logger.info(
+                f"Channel {channel_id} has {attempts} attempts. "
+                f"Next easy threshold: {next_threshold} (interval {interval}). Easy round? {is_easy_round}"
+            )
 
             # Quick inventory stats
             available_count = len(code_state["available_codes"])
@@ -290,6 +296,8 @@ async def handle_mention(event, say, client):
                     await say(f"<@{user_id}> {response}")
                 return
 
+            issued_real_code = False
+
             # Issue a real code only during easy mode and only if user is clearly asking
             if is_easy_round and is_code_request:
                 async with inventory_lock:
@@ -305,6 +313,7 @@ async def handle_mention(event, say, client):
                         issued_code = None
 
                 if issued_code:
+                    issued_real_code = True
                     response = (
                         "Easy mode unlocked! Here's a real free ticket link (one-time use): "
                         f"https://events.humanitix.com/keep-our-community-safe-mlai-hackathon?discountcode={issued_code} "
@@ -317,6 +326,12 @@ async def handle_mention(event, say, client):
                 if SHOULD_REPLY_IN_CHANNEL:
                     await say(f"<@{user_id}> {response}")
                 return
+
+            if is_easy_round:
+                # After any easy round, schedule the next threshold; extend interval if a real code was given
+                if issued_real_code:
+                    state["interval"] += 10
+                state["next_threshold"] = attempts + state["interval"]
 
             giveaway_code = (
                 code_state["available_codes"][0] if is_easy_round and code_state["available_codes"] else None
