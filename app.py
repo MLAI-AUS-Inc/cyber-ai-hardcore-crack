@@ -71,13 +71,15 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable is required for Gemini API")
 
-DISCOUNT_CODE = os.environ.get("DISCOUNT_CODE", "4b0daf70118becc1")
+DISCOUNT_CODE = os.environ.get("DISCOUNT_CODE", "")
 DISCOUNT_CODES_ENV = os.environ.get("DISCOUNT_CODES")
-DISCOUNT_CODE_PATTERN = re.compile(r"discountcode=([^?&#\\s]+)", re.IGNORECASE)
+DISCOUNT_CODE_PATTERN = re.compile(r"discountcode=([^?&#\s]+)", re.IGNORECASE)
+DEPRECATED_CODES = {"4b0daf70118becc1"}
 
 def extract_discount_code(raw: str) -> str:
     """Normalize a code value. Accepts full URLs, query fragments, or raw codes."""
-    cleaned = raw.strip().replace("\n", "").replace("\r", "")
+    # Remove all whitespace to avoid truncation when env values contain spaces/newlines
+    cleaned = re.sub(r"\s+", "", raw.strip())
     match = DISCOUNT_CODE_PATTERN.search(cleaned)
     if match:
         return match.group(1)
@@ -115,10 +117,12 @@ def parse_discount_codes() -> list[str]:
     seen = set()
     unique_codes = []
     for code in codes:
-        if code and code not in seen:
+        if code and code not in DEPRECATED_CODES and code not in seen:
             seen.add(code)
             unique_codes.append(code)
-    return unique_codes or [DISCOUNT_CODE]
+    if not unique_codes:
+        raise ValueError("No valid discount codes configured; please set DISCOUNT_CODES or DISCOUNT_CODE_*")
+    return unique_codes
 
 DISCOUNT_CODES = parse_discount_codes()
 
@@ -132,8 +136,14 @@ def load_code_state() -> dict:
         try:
             with STATE_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-                available = data.get("available_codes", [])
-                used = data.get("used_codes", [])
+                available = [
+                    c for c in data.get("available_codes", [])
+                    if c not in DEPRECATED_CODES and c in DISCOUNT_CODES
+                ]
+                used = [
+                    c for c in data.get("used_codes", [])
+                    if c not in DEPRECATED_CODES and c in DISCOUNT_CODES
+                ]
                 last_given = data.get("last_given_code")
                 # If new codes are added via env, append them to available if not already tracked
                 known_codes = set(available + used)
