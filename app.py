@@ -48,8 +48,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-# Track attempts and dynamic easy-mode thresholds per channel (start at 50, then +20 after a real code is given)
-CHANNEL_STATE = defaultdict(lambda: {"attempts": 0, "interval": 50, "next_threshold": 50})
+# Track attempts and dynamic easy-mode thresholds per channel (start at 15, then +10 after a real code is given)
+CHANNEL_STATE = defaultdict(lambda: {"attempts": 0, "interval": 15, "next_threshold": 15})
 # Track discount code inventory in memory (persisted to disk between restarts)
 inventory_lock = asyncio.Lock()
 STATE_PATH = Path(__file__).parent / "state" / "discount_codes.json"
@@ -330,7 +330,7 @@ async def handle_mention(event, say, client):
             if is_easy_round:
                 # After any easy round, schedule the next threshold; extend interval if a real code was given
                 if issued_real_code:
-                    state["interval"] += 20
+                    state["interval"] += 10
                 state["next_threshold"] = attempts + state["interval"]
 
             giveaway_code = (
